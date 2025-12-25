@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
-from typing import List, Optional
+from typing import List
 import subprocess
 import requests
 import tempfile
@@ -13,7 +13,6 @@ app = FastAPI()
 class MergeRequest(BaseModel):
     video_url: HttpUrl
     audio_url: HttpUrl
-    target_duration: Optional[float] = None
 
 class StitchRequest(BaseModel):
     video_urls: List[HttpUrl]
@@ -30,53 +29,21 @@ def download_file(url: str, suffix: str) -> str:
 
     return temp_file.name
 
-def get_duration(file_path: str) -> float:
-    """Get duration of media file using ffprobe"""
-    probe_cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        file_path
-    ]
-    return float(subprocess.check_output(probe_cmd).decode().strip())
-
-def merge_audio_video(video_path: str, audio_path: str, output_path: str, target_duration: Optional[float] = None):
-    """Merge audio and video with exact duration matching"""
-    
-    # Get actual durations
-    video_duration = get_duration(video_path)
-    audio_duration = get_duration(audio_path)
-    
-    print(f"Video duration: {video_duration}s, Audio duration: {audio_duration}s")
-    
-    # Determine sync duration
-    if target_duration:
-        sync_duration = target_duration
-        print(f"Using target duration: {sync_duration}s")
-    else:
-        sync_duration = min(video_duration, audio_duration)
-        print(f"Using minimum duration: {sync_duration}s")
-    
-    # Calculate speed adjustment for video to match audio
-    speed_factor = video_duration / audio_duration if audio_duration > 0 else 1.0
-    
+def merge_audio_video(video_path: str, audio_path: str, output_path: str):
+    """Merge audio and video using ffmpeg"""
     command = [
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
         "-i", video_path,
         "-i", audio_path,
-        # Trim both to exact duration and adjust video speed to match audio
-        "-filter_complex", 
-        f"[0:v]setpts=PTS*{speed_factor},trim=duration={sync_duration}[v];[1:a]atrim=0:{sync_duration}[a]",
-        "-map", "[v]",
-        "-map", "[a]",
-        "-c:v", "libx264",
-        "-preset", "fast",
+        "-c:v", "copy",
         "-c:a", "aac",
-        "-b:a", "192k",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
         "-shortest",
         output_path
     ]
-    
+
     subprocess.run(command, check=True, capture_output=True)
 
 def stitch_videos(video_paths: List[str], output_path: str):
@@ -112,8 +79,7 @@ async def merge(request: MergeRequest):
     Expected JSON body:
     {
         "video_url": "https://...",
-        "audio_url": "https://...",
-        "target_duration": 8.0  (optional)
+        "audio_url": "https://..."
     }
     """
     try:
@@ -130,9 +96,9 @@ async def merge(request: MergeRequest):
         # Create output file
         output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
 
-        # Merge with target duration if provided
+        # Merge
         print("Merging audio and video...")
-        merge_audio_video(video_path, audio_path, output_path, request.target_duration)
+        merge_audio_video(video_path, audio_path, output_path)
 
         # Clean up input files
         os.unlink(video_path)
