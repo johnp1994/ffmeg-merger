@@ -1,17 +1,40 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
-from typing import List, Optional
+from typing import List, Optional, Dict
 import subprocess
 import requests
 import tempfile
 import os
 import zipfile
 import base64
+import uuid
+import time
 from io import BytesIO
 from pathlib import Path
 
 app = FastAPI()
+
+# In-memory storage for temporary images
+# Format: {image_id: {"path": str, "expires_at": float, "mime_type": str}}
+temp_images: Dict[str, Dict] = {}
+
+def cleanup_expired_images():
+    """Remove expired temporary images"""
+    current_time = time.time()
+    expired_ids = [
+        image_id for image_id, data in temp_images.items()
+        if data["expires_at"] < current_time
+    ]
+    
+    for image_id in expired_ids:
+        try:
+            os.unlink(temp_images[image_id]["path"])
+        except Exception:
+            pass
+        del temp_images[image_id]
+    
+    return len(expired_ids)
 
 class MergeRequest(BaseModel):
     video_url: HttpUrl
@@ -24,6 +47,8 @@ class StitchRequest(BaseModel):
 class FrameExtractRequest(BaseModel):
     video_url: HttpUrl
     timestamps: List[float]  # List of timestamps in seconds
+    return_urls: Optional[bool] = False  # If True, return temporary URLs instead of base64
+    url_expiry_seconds: Optional[int] = 300  # URL expiry time in seconds (default 5 minutes)
 
 def download_file(url: str, suffix: str) -> str:
     """Download file from URL to temporary location"""
@@ -239,9 +264,11 @@ async def extract_frames_endpoint(request: FrameExtractRequest):
     Expected JSON body:
     {
         "video_url": "https://...",
-        "timestamps": [1.5, 3.0, 5.5]  // timestamps in seconds
+        "timestamps": [1.5, 3.0, 5.5],
+        "return_urls": false,  // Optional: if true, returns temporary URLs instead of base64
+        "url_expiry_seconds": 300  // Optional: URL expiry time (default 300s/5min)
     }
-    Returns JSON with base64-encoded images for n8n integration
+    Returns JSON with base64-encoded images or temporary URLs for n8n integration
     """
     try:
         if not request.timestamps:
@@ -272,29 +299,61 @@ async def extract_frames_endpoint(request: FrameExtractRequest):
         # Clean up video file
         os.unlink(video_path)
         
-        # Convert frames to base64 for n8n
+        # Cleanup expired images before adding new ones
+        cleanup_expired_images()
+        
         frames_data = []
-        for i, frame_path in enumerate(frame_paths):
-            with open(frame_path, 'rb') as f:
-                image_data = f.read()
-                base64_image = base64.b64encode(image_data).decode('utf-8')
+        
+        if request.return_urls:
+            # Return temporary URLs
+            expiry_time = time.time() + request.url_expiry_seconds
+            
+            for i, frame_path in enumerate(frame_paths):
+                image_id = str(uuid.uuid4())
+                
+                # Store frame info
+                temp_images[image_id] = {
+                    "path": frame_path,
+                    "expires_at": expiry_time,
+                    "mime_type": "image/jpeg"
+                }
+                
+                # Get base URL from request (you'll need to set this to your actual Cloud Run URL)
+                temp_url = f"/temp-image/{image_id}"
                 
                 frames_data.append({
                     "timestamp": request.timestamps[i],
                     "frame_number": i,
-                    "image_base64": base64_image,
+                    "image_url": temp_url,
+                    "expires_at": expiry_time,
+                    "expires_in_seconds": request.url_expiry_seconds,
                     "mime_type": "image/jpeg",
                     "filename": f"frame_{i}_at_{request.timestamps[i]}s.jpg"
                 })
-            
-            # Clean up frame file
-            os.unlink(frame_path)
+        else:
+            # Return base64 encoded images
+            for i, frame_path in enumerate(frame_paths):
+                with open(frame_path, 'rb') as f:
+                    image_data = f.read()
+                    base64_image = base64.b64encode(image_data).decode('utf-8')
+                    
+                    frames_data.append({
+                        "timestamp": request.timestamps[i],
+                        "frame_number": i,
+                        "image_base64": base64_image,
+                        "mime_type": "image/jpeg",
+                        "filename": f"frame_{i}_at_{request.timestamps[i]}s.jpg"
+                    })
+                
+                # Clean up frame file
+                os.unlink(frame_path)
         
         return {
             "success": True,
             "video_url": video_url,
             "video_duration": video_duration,
             "frames_count": len(frames_data),
+            "return_type": "urls" if request.return_urls else "base64",
             "frames": frames_data
         }
         
@@ -304,6 +363,35 @@ async def extract_frames_endpoint(request: FrameExtractRequest):
         raise HTTPException(status_code=500, detail=f"FFmpeg error: {e.stderr.decode()}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/temp-image/{image_id}")
+async def get_temp_image(image_id: str):
+    """
+    Serve a temporary image by its ID
+    Images expire after the specified time and are automatically cleaned up
+    """
+    # Cleanup expired images first
+    cleanup_expired_images()
+    
+    if image_id not in temp_images:
+        raise HTTPException(status_code=404, detail="Image not found or expired")
+    
+    image_data = temp_images[image_id]
+    
+    # Check if expired
+    if image_data["expires_at"] < time.time():
+        try:
+            os.unlink(image_data["path"])
+        except Exception:
+            pass
+        del temp_images[image_id]
+        raise HTTPException(status_code=410, detail="Image has expired")
+    
+    # Return the image
+    return FileResponse(
+        image_data["path"],
+        media_type=image_data["mime_type"]
+    )
 
 @app.get("/health")
 async def health():
