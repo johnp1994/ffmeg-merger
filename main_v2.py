@@ -6,9 +6,6 @@ import subprocess
 import requests
 import tempfile
 import os
-import zipfile
-import base64
-from io import BytesIO
 from pathlib import Path
 
 app = FastAPI()
@@ -20,10 +17,6 @@ class MergeRequest(BaseModel):
 
 class StitchRequest(BaseModel):
     video_urls: List[HttpUrl]
-
-class FrameExtractRequest(BaseModel):
-    video_url: HttpUrl
-    timestamps: List[float]  # List of timestamps in seconds
 
 def download_file(url: str, suffix: str) -> str:
     """Download file from URL to temporary location"""
@@ -111,29 +104,6 @@ def stitch_videos(video_paths: List[str], output_path: str):
 
     # Clean up concat file
     os.unlink(concat_file.name)
-
-def extract_frames(video_path: str, timestamps: List[float]) -> List[str]:
-    """Extract frames from video at specified timestamps"""
-    frame_paths = []
-    
-    for i, timestamp in enumerate(timestamps):
-        # Create temp file for this frame
-        frame_path = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg').name
-        
-        command = [
-            "ffmpeg",
-            "-y",
-            "-ss", str(timestamp),  # Seek to timestamp
-            "-i", video_path,
-            "-frames:v", "1",  # Extract only 1 frame
-            "-q:v", "2",  # High quality (1-31, lower is better)
-            frame_path
-        ]
-        
-        subprocess.run(command, check=True, capture_output=True)
-        frame_paths.append(frame_path)
-    
-    return frame_paths
 
 @app.post("/merge")
 async def merge(request: MergeRequest):
@@ -225,79 +195,6 @@ async def stitch(request: StitchRequest):
             filename='stitched_output.mp4'
         )
 
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"FFmpeg error: {e.stderr.decode()}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/extract-frames")
-async def extract_frames_endpoint(request: FrameExtractRequest):
-    """
-    Endpoint to extract frames from a video at specified timestamps
-    Expected JSON body:
-    {
-        "video_url": "https://...",
-        "timestamps": [1.5, 3.0, 5.5]  // timestamps in seconds
-    }
-    Returns JSON with base64-encoded images for n8n integration
-    """
-    try:
-        if not request.timestamps:
-            raise HTTPException(status_code=400, detail="At least one timestamp is required")
-        
-        video_url = str(request.video_url)
-        
-        # Download video
-        print(f"Downloading video from: {video_url}")
-        video_path = download_file(video_url, '.mp4')
-        
-        # Get video duration to validate timestamps
-        video_duration = get_duration(video_path)
-        
-        # Validate timestamps
-        for ts in request.timestamps:
-            if ts < 0 or ts > video_duration:
-                os.unlink(video_path)
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Timestamp {ts}s is out of range. Video duration is {video_duration}s"
-                )
-        
-        # Extract frames
-        print(f"Extracting {len(request.timestamps)} frames...")
-        frame_paths = extract_frames(video_path, request.timestamps)
-        
-        # Clean up video file
-        os.unlink(video_path)
-        
-        # Convert frames to base64 for n8n
-        frames_data = []
-        for i, frame_path in enumerate(frame_paths):
-            with open(frame_path, 'rb') as f:
-                image_data = f.read()
-                base64_image = base64.b64encode(image_data).decode('utf-8')
-                
-                frames_data.append({
-                    "timestamp": request.timestamps[i],
-                    "frame_number": i,
-                    "image_base64": base64_image,
-                    "mime_type": "image/jpeg",
-                    "filename": f"frame_{i}_at_{request.timestamps[i]}s.jpg"
-                })
-            
-            # Clean up frame file
-            os.unlink(frame_path)
-        
-        return {
-            "success": True,
-            "video_url": video_url,
-            "video_duration": video_duration,
-            "frames_count": len(frames_data),
-            "frames": frames_data
-        }
-        
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
     except subprocess.CalledProcessError as e:
