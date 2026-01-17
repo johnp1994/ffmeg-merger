@@ -494,7 +494,8 @@ async def generate_videos(request: GenerateVideoRequest):
                 response.raise_for_status()
                 data = response.json()
                 
-                if 'data' not in data or 'taskId' not in data['data']:
+                # Robust validation
+                if not isinstance(data, dict) or not isinstance(data.get('data'), dict) or 'taskId' not in data['data']:
                     print(f"Unexpected response format: {data}")
                     raise HTTPException(status_code=500, detail=f"Unexpected Veo API response format: {data}")
 
@@ -542,11 +543,8 @@ async def generate_videos(request: GenerateVideoRequest):
 
                     status_data = status_response.json()
                     
-                    # Log data for debugging
-                    # print(f"Poll data for {task['task_id']}: {str(status_data)[:100]}...")
-                    
-                    if 'data' not in status_data:
-                        print(f"Missing 'data' in status response: {status_data}")
+                    if not isinstance(status_data, dict) or 'data' not in status_data or not isinstance(status_data['data'], dict):
+                        print(f"Invalid status response format: {status_data}")
                         continue
 
                     # Check successFlag (1 = success based on n8n screenshot)
@@ -574,9 +572,9 @@ async def generate_videos(request: GenerateVideoRequest):
         for t in tasks:
             res = t["result"]
             url = None
-            if res and "response" in res and res["response"] and "resultUrls" in res["response"]:
+            if isinstance(res, dict) and isinstance(res.get("response"), dict) and "resultUrls" in res["response"]:
                  urls = res["response"]["resultUrls"]
-                 if urls:
+                 if isinstance(urls, list) and urls:
                      url = urls[0]
             video_urls.append(url)
 
