@@ -433,9 +433,6 @@ async def generate_image(request: ProcessImageRequest):
                 
                 # If created or processing, continue loop
             except requests.exceptions.RequestException as e:
-                # Log error but continue polling unless it's critical? 
-                # For now, let's treat network errors as fatal or retryable? 
-                # We'll fail on request exception to be safe/simple.
                 print(f"Polling error: {e}")
                 raise e
             
@@ -445,6 +442,126 @@ async def generate_image(request: ProcessImageRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+class VideoScene(BaseModel):
+    prompt: str
+
+class GenerateVideoRequest(BaseModel):
+    scenes: List[VideoScene]
+    image_url: HttpUrl
+    api_key: Optional[str] = "ab21af497248a9cbf021583736ccaf01"
+
+@app.post("/generate-videos")
+async def generate_videos(request: GenerateVideoRequest):
+    """
+    Endpoint to generate multiple video scenes using Veo API.
+    Initiates all scenes and polls until ALL are completed.
+    """
+    api_url_generate = "https://api.kie.ai/api/v1/veo/generate"
+    api_url_status = "https://api.kie.ai/api/v1/veo/record-info"
+    
+    headers = {
+        "Authorization": f"Bearer {request.api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    tasks = []
+    
+    # Step 1: Initiate all video generation tasks
+    print(f"Initiating {len(request.scenes)} video generation tasks...")
+    
+    try:
+        for i, scene in enumerate(request.scenes):
+            payload = {
+                "model": "veo3_fast",
+                "aspectRatio": "9:16",
+                "prompt": scene.prompt,
+                "imageUrls": [str(request.image_url)]
+            }
+            
+            print(f"Starting task {i+1}/{len(request.scenes)}...")
+            response = requests.post(api_url_generate, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            task_id = data['data']['taskId']
+            tasks.append({
+                "task_id": task_id,
+                "scene_index": i,
+                "completed": False,
+                "result": None
+            })
+            print(f"Task {i+1} started with ID: {task_id}")
+            
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Failed to initiate video generation: {str(e)}")
+
+    # Step 2: Poll until all tasks are completed
+    start_time = time.time()
+    timeout_seconds = 600  # 10 minutes (videos take longer)
+    
+    print("Waiting for all tasks to complete...")
+    
+    while True:
+        if time.time() - start_time > timeout_seconds:
+            raise HTTPException(status_code=504, detail="Video generation timed out after 10 minutes")
+
+        all_completed = True
+        
+        for task in tasks:
+            if task["completed"]:
+                continue
+                
+            all_completed = False
+            
+            try:
+                # Poll status
+                status_response = requests.get(
+                    api_url_status, 
+                    params={"taskId": task["task_id"]}, 
+                    headers=headers
+                )
+                status_response.raise_for_status()
+                status_data = status_response.json()
+                
+                # Check successFlag (1 = success based on n8n screenshot)
+                success_flag = status_data['data'].get('successFlag')
+                
+                if success_flag == 1 or status_data['data'].get("response") is not None:
+                    print(f"Task {task['task_id']} completed!")
+                    task["completed"] = True
+                    task["result"] = status_data['data']
+                else:
+                    # Still processing
+                    pass
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"Error polling task {task['task_id']}: {e}")
+                # Don't fail immediately, retry next loop
+        
+        if all_completed:
+            break
+            
+        await asyncio.sleep(10)  # Wait 10 seconds between polls
+    
+    # Extract flat list of video URLs for easier n8n usage
+    video_urls = []
+    for t in tasks:
+        # Structure is usually data -> response -> resultUrls
+        # We stored status_data['data'] in task["result"]
+        res = t["result"]
+        url = None
+        if res and "response" in res and res["response"] and "resultUrls" in res["response"]:
+             urls = res["response"]["resultUrls"]
+             if urls:
+                 url = urls[0]
+        video_urls.append(url)
+
+    return {
+        "status": "completed",
+        "results": [t["result"] for t in tasks],
+        "video_urls": video_urls
+    }
 
 
 @app.get("/temp-image/{image_id}")
