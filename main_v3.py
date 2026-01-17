@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 from typing import List, Optional, Dict
@@ -10,7 +10,6 @@ import zipfile
 import base64
 import uuid
 import time
-import asyncio
 from io import BytesIO
 from pathlib import Path
 
@@ -50,11 +49,6 @@ class FrameExtractRequest(BaseModel):
     timestamps: List[float]  # List of timestamps in seconds
     return_urls: Optional[bool] = False  # If True, return temporary URLs instead of base64
     url_expiry_seconds: Optional[int] = 300  # URL expiry time in seconds (default 5 minutes)
-
-class ProcessImageRequest(BaseModel):
-    prompt: str
-    image_url: HttpUrl
-    api_key: Optional[str] = "a88def51a99f7895238d00ccff7b07b36b97f3e005a07e099afdba2e68f5d914"
 
 def download_file(url: str, suffix: str) -> str:
     """Download file from URL to temporary location"""
@@ -369,83 +363,6 @@ async def extract_frames_endpoint(request: FrameExtractRequest):
         raise HTTPException(status_code=500, detail=f"FFmpeg error: {e.stderr.decode()}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/generate-image")
-async def generate_image(request: ProcessImageRequest):
-    """
-    Endpoint to process an image using Wavespeed API.
-    It initiates the image edition and polls until completion.
-    """
-    api_url_create = "https://api.wavespeed.ai/api/v3/google/nano-banana/edit"
-    
-    headers = {
-        "Authorization": f"Bearer {request.api_key}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "enable_base64_output": False,
-        "enable_sync_mode": False,
-        "images": [str(request.image_url)],
-        "output_format": "png",
-        "prompt": request.prompt
-    }
-
-    try:
-        # Step 1: Create Image
-        print("Initiating image creation...")
-        response = requests.post(api_url_create, json=payload, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        
-        prediction_id = data['data']['id']
-        print(f"Image creation started. ID: {prediction_id}")
-
-        # Step 2: Poll for completion
-        api_url_status = f"https://api.wavespeed.ai/api/v3/predictions/{prediction_id}/result"
-        
-        start_time = time.time()
-        timeout_seconds = 300  # 5 minutes
-
-        while True:
-            # Check for timeout
-            if time.time() - start_time > timeout_seconds:
-                raise HTTPException(status_code=504, detail="Image processing timed out after 5 minutes")
-
-            await asyncio.sleep(10)  # Wait 10 seconds between polls
-            print(f"Checking status for {prediction_id}...")
-            
-            try:
-                status_response = requests.get(api_url_status, headers=headers)
-                status_response.raise_for_status()
-                status_data = status_response.json()
-                
-                status = status_data['data']['status']
-                print(f"Current status: {status}")
-
-                if status == 'completed':
-                    return {
-                        "status": "completed",
-                        "result": status_data['data']
-                    }
-                elif status == 'failed':
-                    raise HTTPException(status_code=500, detail=f"Image processing failed: {status_data['data'].get('error', 'Unknown error')}")
-                
-                # If created or processing, continue loop
-            except requests.exceptions.RequestException as e:
-                # Log error but continue polling unless it's critical? 
-                # For now, let's treat network errors as fatal or retryable? 
-                # We'll fail on request exception to be safe/simple.
-                print(f"Polling error: {e}")
-                raise e
-            
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"API request failed: {str(e)}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/temp-image/{image_id}")
 async def get_temp_image(image_id: str):
